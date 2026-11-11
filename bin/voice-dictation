@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""voice-dictation-wayland: offline Chinese push-to-talk dictation for Wayland.
+
+Pipeline: ffmpeg (PipeWire) -> Silero VAD -> SenseVoice (sherpa-onnx)
+          -> clipboard + ydotool paste.
+
+Part of voice-dictation-wayland <https://github.com/Moxin1044/voice-dictation-wayland>
+MIT License. ASR powered by sherpa-onnx and FunAudioLLM SenseVoice.
+"""
+
+import argparse
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import wave
+
+__version__ = "1.0.0"
+
+HOME = os.path.expanduser("~")
+DATA_HOME = os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local/share"))
+DEFAULT_MODEL_DIR = os.path.join(DATA_HOME, "voice-input/models/sense-voice")
+DEFAULT_VAD_MODEL = os.path.join(DATA_HOME, "voice-input/models/vad/silero_vad.onnx")
+
+MODEL_DIR = os.environ.get("VOICE_MODEL_DIR", DEFAULT_MODEL_DIR)
+VAD_MODEL = os.environ.get("VOICE_VAD_MODEL", DEFAULT_VAD_MODEL)
+MAX_SECONDS = int(os.environ.get("VOICE_MAX_SECONDS", "120"))
+THREADS = os.environ.get("VOICE_THREADS", "4")
+DEFAULT_PASTE = os.environ.get("VOICE_PASTE_MODE", "ctrl-v")
+
+STATE_DIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "voice-dictation")
+PID_FILE = os.path.join(STATE_DIR, "rec.pid")
+WAV_FILE = os.path.join(STATE_DIR, "rec.wav")
+
+PASTE_KEYS = {
+    "ctrl-v": ["29:1", "47:1", "47:0", "29:0"],
+    "ctrl-shift-v": ["29:1", "42:1", "47:1", "47:0", "42:0", "29:0"],
+}
+
+DEVNULL = subprocess.DEVNULL
+
+
+def notify(summary, body=""):
+    """Desktop notification, falling back to stderr on non-GNOME systems."""
+    if shutil.which("notify-send") and os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+        subprocess.run(
+            ["notify-send", "-a", "voice-dictation", "-i", "audio-input-microphone", summary, body],
+            check=False,
+            stdout=DEVNULL,
+            stderr=DEVNULL,
+        )
+    else:
+        print(f"[voice-dictation] {summary} {body}".rstrip(), file=sys.stderr)
+
+
+def die(message):
+    notify("语音输入不可用", message)
+    print(f"voice-dictation: {message}", file=sys.stderr)
+    return 2
+
+
+def check_dependencies():
+    missing = [
+        name
+        for name in (
+            "ffmpeg",
+            "wl-copy",
+            "ydotool",
+            "sherpa-onnx-vad-with-offline-asr",
+        )
+        if shutil.which(name) is None
+    ]
+    if missing:
+        return die("缺少依赖：" + ", ".join(missing) + "（运行 install.sh 安装）")
+    if not os.path.isfile(os.path.join(MODEL_DIR, "model.int8.onnx")):
+        return die(f"找不到模型：{MODEL_DIR}（运行 scripts/download-model.sh）")
+    if not os.path.isfile(VAD_MODEL):
+        return die(f"找不到 VAD 模型：{VAD_MODEL}")
+    return 0
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def read_pid():
+    try:
+        with open(PID_FILE) as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    return pid if alive(pid) else None
+
+
+def start_recording():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        os.unlink(WAV_FILE)
+    except FileNotFoundError:
+        pass
+    proc = subprocess.Popen(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "pulse", "-i", "default",
+            "-t", str(MAX_SECONDS),
+            "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", WAV_FILE,
+        ],
+        stdin=DEVNULL,
+        stdout=DEVNULL,
+        stderr=DEVNULL,
+        start_new_session=True,  # outlive the shell that launched the shortcut
+    )
+    time.sleep(0.3)
+    if not alive(proc.pid):
+        notify("录音启动失败", "检查麦克风和 PipeWire 是否正常")
+        return False
+    with open(PID_FILE, "w") as f:
+        f.write(str(proc.pid))
+    notify("🎤 录音中…", "再按一次快捷键结束")
+    return True
+
+
+def stop_recording():
+    pid = read_pid()
+    if pid is None:
+        notify("没有正在进行的录音", "先按一下快捷键开始")
+        return None
+    os.kill(pid, signal.SIGINT)
+    for _ in range(60):
+        if not alive(pid):
+            break
+        time.sleep(0.1)
+    else:
+        os.kill(pid, signal.SIGKILL)
+    try:
+        os.unlink(PID_FILE)
+    except FileNotFoundError:
+        pass
+    return WAV_FILE
+
+
+def wav_duration(path):
+    try:
+        with wave.open(path) as w:
+            return w.getnframes() / float(w.getframerate())
+    except (OSError, wave.Error, ZeroDivisionError):
+        return 0.0
+
+
+def transcribe(path):
+    """Silero VAD first, so silence/noise produces no text at all."""
+    result = subprocess.run(
+        [
+            "sherpa-onnx-vad-with-offline-asr",
+            "--silero-vad-model=" + VAD_MODEL,
+            "--tokens=" + os.path.join(MODEL_DIR, "tokens.txt"),
+            "--sense-voice-model=" + os.path.join(MODEL_DIR, "model.int8.onnx"),
+            "--sense-voice-use-itn=true",
+            "--num-threads=" + THREADS,
+            path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    parts = []
+    for line in result.stdout.splitlines():
+        match = re.match(r"^\s*[\d.]+ -- [\d.]+:\s*(.+?)\s*$", line)
+        if match:
+            parts.append(match.group(1))
+    return "".join(parts)
+
+
+def paste_text(text, mode):
+    if mode == "none":
+        return
+    subprocess.run(["wl-copy"], input=text, text=True, check=True)
+    time.sleep(0.2)
+    subprocess.run(["ydotool", "key", *PASTE_KEYS[mode]], check=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="voice-dictation",
+        description="Offline Chinese push-to-talk dictation for Wayland.",
+    )
+    parser.add_argument("--file", help="transcribe this wav instead of toggling the recorder")
+    parser.add_argument("--dry-run", action="store_true", help="print text instead of pasting")
+    parser.add_argument("--stop", action="store_true", help="stop the active recording")
+    parser.add_argument(
+        "--paste",
+        choices=["ctrl-v", "ctrl-shift-v", "none"],
+        default=DEFAULT_PASTE,
+        help="keyboard shortcut used to paste (default: %(default)s)",
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    args = parser.parse_args()
+
+    if not args.file:
+        rc = check_dependencies()
+        if rc:
+            return rc
+
+    if args.file:
+        wav = args.file
+    else:
+        if args.stop or read_pid() is not None:
+            wav = stop_recording()
+            if wav is None:
+                return 1
+        else:
+            return 0 if start_recording() else 1
+
+    if wav_duration(wav) < 0.4:
+        notify("录音太短", "说完再按一次快捷键结束")
+        return 1
+
+    notify("⏳ 识别中…")
+    text = transcribe(wav)
+    if not text:
+        notify("没听清", "没有检测到说话声，再试一次")
+        return 1
+
+    if args.dry_run:
+        print(text)
+        return 0
+
+    try:
+        paste_text(text, args.paste)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        notify("粘贴失败", "识别结果已在剪贴板，可手动粘贴")
+        print(f"voice-dictation: {exc}", file=sys.stderr)
+        print(text)
+        return 1
+
+    notify("✅ 已输入", text[:60] + ("…" if len(text) > 60 else ""))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

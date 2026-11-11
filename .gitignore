@@ -1,0 +1,9 @@
+# models and audio are downloaded, never committed
+models/
+*.onnx
+*.wav
+*.part
+
+__pycache__/
+*.pyc
+.venv/
